@@ -6,32 +6,65 @@
 // index.js to `await` every call. Do not deploy until that's done.
 // ============================================================================
 require('dotenv').config(); // loads .env locally; on Render, real env vars are used and this is a harmless no-op
+const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { Redis } = require('@upstash/redis');
 
-if (!process.env.DATABASE_URL) {
-  throw new Error('DATABASE_URL is not set — configure a Postgres connection string (Render Postgres, Supabase, or Neon).');
+let pool;
+if (process.env.DATABASE_URL) {
+  const isInternalOrLocal = 
+    process.env.DATABASE_URL.includes('localhost') || 
+    process.env.DATABASE_URL.includes('127.0.0.1') ||
+    process.env.DATABASE_URL.includes('.render.internal');
+
+  const sslConfig = () => {
+    if (process.env.DATABASE_SSL === 'true') return { rejectUnauthorized: false };
+    if (process.env.DATABASE_SSL === 'false') return false;
+    if (isInternalOrLocal) return false;
+    return { rejectUnauthorized: false };
+  };
+
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: sslConfig(),
+    max: 10
+  });
+  pool.on('error', (err) => console.error('Unexpected Postgres pool error:', err));
+} else {
+  console.log('DATABASE_URL not set — initializing embedded Postgres (PGlite) in server/data/pgdata...');
+  const { PGlite } = require('@electric-sql/pglite');
+  const dbDir = path.join(__dirname, 'data', 'pgdata');
+  fs.mkdirSync(dbDir, { recursive: true });
+  const pglite = new PGlite(dbDir);
+  pool = {
+    async query(sql, params = []) {
+      if (!params || params.length === 0) {
+        try {
+          const res = await pglite.exec(sql);
+          if (Array.isArray(res)) {
+            const last = res[res.length - 1];
+            return { rows: (last && last.rows) || [] };
+          }
+          return { rows: (res && res.rows) || [] };
+        } catch (e) {
+          const res = await pglite.query(sql);
+          return { rows: (res && res.rows) || [] };
+        }
+      }
+      const res = await pglite.query(sql, params);
+      return { rows: (res && res.rows) || [] };
+    },
+    async connect() {
+      return {
+        query: (sql, params = []) => pool.query(sql, params),
+        release: () => {}
+      };
+    },
+    on() {}
+  };
 }
-
-const isInternalOrLocal = !process.env.DATABASE_URL || 
-  process.env.DATABASE_URL.includes('localhost') || 
-  process.env.DATABASE_URL.includes('127.0.0.1') ||
-  process.env.DATABASE_URL.includes('.render.internal');
-
-const sslConfig = () => {
-  if (process.env.DATABASE_SSL === 'true') return { rejectUnauthorized: false };
-  if (process.env.DATABASE_SSL === 'false') return false;
-  if (isInternalOrLocal) return false;
-  return { rejectUnauthorized: false };
-};
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: sslConfig(),
-  max: 10
-});
-pool.on('error', (err) => console.error('Unexpected Postgres pool error:', err));
 
 async function query(sql, params = []) {
   const { rows } = await pool.query(sql, params);
