@@ -11,19 +11,25 @@ const { Pool } = require('pg');
 const { Redis } = require('@upstash/redis');
 
 if (!process.env.DATABASE_URL) {
-  throw new Error('DATABASE_URL is not set — use the Supabase "Transaction" pooler connection string (port 6543).');
-}
-if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
-  throw new Error('UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN are not set.');
+  throw new Error('DATABASE_URL is not set — configure a Postgres connection string (Render Postgres, Supabase, or Neon).');
 }
 
-// Supavisor (Supabase's pooler) speaks the Postgres wire protocol, so the
-// regular `pg` driver works unchanged — just point DATABASE_URL at the
-// pooled connection string instead of the direct one.
+const isInternalOrLocal = !process.env.DATABASE_URL || 
+  process.env.DATABASE_URL.includes('localhost') || 
+  process.env.DATABASE_URL.includes('127.0.0.1') ||
+  process.env.DATABASE_URL.includes('.render.internal');
+
+const sslConfig = () => {
+  if (process.env.DATABASE_SSL === 'true') return { rejectUnauthorized: false };
+  if (process.env.DATABASE_SSL === 'false') return false;
+  if (isInternalOrLocal) return false;
+  return { rejectUnauthorized: false };
+};
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 10 // keep small — Supavisor is what actually manages the real fan-out
+  ssl: sslConfig(),
+  max: 10
 });
 pool.on('error', (err) => console.error('Unexpected Postgres pool error:', err));
 
@@ -36,22 +42,42 @@ async function queryOne(sql, params = []) {
   return rows[0] || null;
 }
 
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN
-});
+const hasRedis = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+const redis = hasRedis
+  ? new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN
+    })
+  : null;
 
-// ---- Cache-aside layer (Layer 2 — replaces the old in-process Map cache;
-// this one is shared across every server instance, not just one process) ----
+// ---- Cache-aside layer (replaces in-process Map cache if Redis is configured) ----
+const memCache = new Map();
 const CACHE_TTL_SEC = 60;
+
 async function cacheGet(key) {
-  try { return await redis.get(key); } catch (e) { console.error('Redis get failed:', e.message); return null; }
+  if (redis) {
+    try { return await redis.get(key); } catch (e) { console.error('Redis get failed:', e.message); return null; }
+  }
+  const item = memCache.get(key);
+  if (!item) return null;
+  if (Date.now() > item.expiresAt) { memCache.delete(key); return null; }
+  return item.value;
 }
+
 async function cacheSet(key, value) {
-  try { await redis.set(key, value, { ex: CACHE_TTL_SEC }); } catch (e) { console.error('Redis set failed:', e.message); }
+  if (redis) {
+    try { await redis.set(key, value, { ex: CACHE_TTL_SEC }); } catch (e) { console.error('Redis set failed:', e.message); }
+    return;
+  }
+  memCache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_SEC * 1000 });
 }
+
 async function cacheDel(key) {
-  try { await redis.del(key); } catch (e) { console.error('Redis del failed:', e.message); }
+  if (redis) {
+    try { await redis.del(key); } catch (e) { console.error('Redis del failed:', e.message); }
+    return;
+  }
+  memCache.delete(key);
 }
 const userKey = (id) => `user:${id}`;
 const convoKey = (id) => `convo:${id}`;
